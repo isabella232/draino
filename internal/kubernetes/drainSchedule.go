@@ -65,7 +65,8 @@ func (d *DrainSchedules) DeleteSchedule(name string) {
 	if s, ok := d.schedules[name]; ok {
 		s.timer.Stop()
 	} else {
-		d.logger.Error("Failed schedule deletion", zap.String("key", name))
+		d.logger.Info("No schedule to delete", zap.String("key", name))
+		return
 	}
 	delete(d.schedules, name)
 }
