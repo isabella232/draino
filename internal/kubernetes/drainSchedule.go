@@ -19,6 +19,8 @@ import (
 const (
 	SetConditionTimeout     = 10 * time.Second
 	SetConditionRetryPeriod = 50 * time.Millisecond
+
+	CustomDrainBufferAnnotation = "draino/drain-buffer"
 )
 
 type DrainScheduler interface {
@@ -31,7 +33,7 @@ type DrainSchedules struct {
 	sync.Mutex
 	schedules map[string]*schedule
 
-	lastDrainScheduledFor time.Time
+	lastDrainScheduledKey string
 	period                time.Duration
 
 	logger        *zap.Logger
@@ -70,13 +72,26 @@ func (d *DrainSchedules) DeleteSchedule(name string) {
 	delete(d.schedules, name)
 }
 
-func (d *DrainSchedules) WhenNextSchedule() time.Time {
+func (d *DrainSchedules) whenNextSchedule() time.Time {
 	// compute drain schedule time
 	sooner := time.Now().Add(SetConditionTimeout + time.Second)
-	when := d.lastDrainScheduledFor.Add(d.period)
+	period := d.period
+	var when time.Time
+	fmt.Printf("previous key=%s\n", d.lastDrainScheduledKey)
+	fmt.Printf("map=%v\n", d.schedules)
+	if lastSchedule, ok := d.schedules[d.lastDrainScheduledKey]; ok {
+		fmt.Printf("found previous sched\n")
+		if lastSchedule.customDrainBuffer != nil {
+			fmt.Printf("found custom drain buffer\n")
+			period = *lastSchedule.customDrainBuffer
+		}
+		when = lastSchedule.when.Add(period)
+	}
+
 	if when.Before(sooner) {
 		when = sooner
 	}
+	fmt.Printf("sched: %v\n", when)
 	return when
 }
 
@@ -88,9 +103,9 @@ func (d *DrainSchedules) Schedule(node *v1.Node) (time.Time, error) {
 	}
 
 	// compute drain schedule time
-	when := d.WhenNextSchedule()
-	d.lastDrainScheduledFor = when
-	d.schedules[node.GetName()] = d.newSchedule(node, when)
+	when := d.whenNextSchedule()
+	d.lastDrainScheduledKey = node.GetName()
+	d.schedules[d.lastDrainScheduledKey] = d.newSchedule(node, when)
 	d.Unlock()
 
 	// Mark the node with the condition stating that drain is scheduled
@@ -109,10 +124,11 @@ func (d *DrainSchedules) Schedule(node *v1.Node) (time.Time, error) {
 }
 
 type schedule struct {
-	when   time.Time
-	failed int32
-	finish time.Time
-	timer  *time.Timer
+	when              time.Time
+	customDrainBuffer *time.Duration
+	failed            int32
+	finish            time.Time
+	timer             *time.Timer
 }
 
 func (s *schedule) setFailed() {
@@ -124,12 +140,20 @@ func (s *schedule) isFailed() bool {
 }
 
 func (d *DrainSchedules) newSchedule(node *v1.Node, when time.Time) *schedule {
+	nr := &core.ObjectReference{Kind: "Node", Name: node.GetName(), UID: types.UID(node.GetName())}
 	sched := &schedule{
 		when: when,
 	}
+	if customDrainBuffer, ok := node.Annotations[CustomDrainBufferAnnotation]; ok {
+		durationValue, err := time.ParseDuration(customDrainBuffer)
+		if err != nil {
+			d.eventRecorder.Eventf(nr, core.EventTypeWarning, eventReasonDrainConfig, "Failed to parse custom drain-buffer: %s", customDrainBuffer)
+		}
+		sched.customDrainBuffer = &durationValue
+	}
+
 	sched.timer = time.AfterFunc(time.Until(when), func() {
 		log := d.logger.With(zap.String("node", node.GetName()))
-		nr := &core.ObjectReference{Kind: "Node", Name: node.GetName(), UID: types.UID(node.GetName())}
 		tags, _ := tag.New(context.Background(), tag.Upsert(TagNodeName, node.GetName())) // nolint:gosec
 		d.eventRecorder.Event(nr, core.EventTypeWarning, eventReasonDrainStarting, "Draining node")
 		if err := d.drainer.Drain(node); err != nil {

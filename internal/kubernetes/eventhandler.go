@@ -50,6 +50,7 @@ const (
 	eventReasonDrainStarting         = "DrainStarting"
 	eventReasonDrainSucceeded        = "DrainSucceeded"
 	eventReasonDrainFailed           = "DrainFailed"
+	eventReasonDrainConfig           = "DrainConfig"
 
 	tagResultSucceeded = "succeeded"
 	tagResultFailed    = "failed"
