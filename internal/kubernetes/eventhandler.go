@@ -84,8 +84,9 @@ type DrainingResourceEventHandler struct {
 	podStore     PodStore
 	cordonFilter PodFilterFunc
 
-	lastDrainScheduledFor time.Time
-	buffer                time.Duration
+	lastDrainScheduledFor  time.Time
+	buffer                 time.Duration
+	labelKeyForDrainGroups []string
 
 	conditions []SuppliedCondition
 }
@@ -124,6 +125,17 @@ func WithCordonPodFilter(f PodFilterFunc, podStore PodStore) DrainingResourceEve
 	}
 }
 
+// WithDrainGroups configures draining groups. Schedules are done per groups
+func WithDrainGroups(labelKeysForDrainGroup string) DrainingResourceEventHandlerOption {
+	var drainGroup []string
+	if labelKeysForDrainGroup != "" {
+		drainGroup = strings.Split(labelKeysForDrainGroup, ",")
+	}
+	return func(d *DrainingResourceEventHandler) {
+		d.labelKeyForDrainGroups = drainGroup
+	}
+}
+
 // NewDrainingResourceEventHandler returns a new DrainingResourceEventHandler.
 func NewDrainingResourceEventHandler(d CordonDrainer, e record.EventRecorder, ho ...DrainingResourceEventHandlerOption) *DrainingResourceEventHandler {
 	h := &DrainingResourceEventHandler{
@@ -136,7 +148,7 @@ func NewDrainingResourceEventHandler(d CordonDrainer, e record.EventRecorder, ho
 	for _, o := range ho {
 		o(h)
 	}
-	h.drainScheduler = NewDrainSchedules(d, e, h.buffer, h.logger)
+	h.drainScheduler = NewDrainSchedules(d, e, h.buffer, h.labelKeyForDrainGroups, h.logger)
 	return h
 }
 
@@ -163,17 +175,17 @@ func (h *DrainingResourceEventHandler) OnDelete(obj interface{}) {
 		if !ok {
 			return
 		}
-		h.drainScheduler.DeleteSchedule(d.Key)
+		h.drainScheduler.DeleteScheduleByName(d.Key)
 	}
 
-	h.drainScheduler.DeleteSchedule(n.GetName())
+	h.drainScheduler.DeleteSchedule(n)
 }
 
 func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 	badConditions := h.offendingConditions(n)
 	if len(badConditions) == 0 {
 		if shouldUncordon(n) {
-			h.drainScheduler.DeleteSchedule(n.GetName())
+			h.drainScheduler.DeleteSchedule(n)
 			h.uncordon(n)
 		}
 		return
@@ -191,7 +203,7 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 	}
 
 	// Let's ensure that a drain is scheduled
-	hasSChedule, failedDrain := h.drainScheduler.HasSchedule(n.GetName())
+	hasSChedule, failedDrain := h.drainScheduler.HasSchedule(n)
 	if !hasSChedule {
 		h.scheduleDrain(n)
 		return
@@ -199,7 +211,7 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 
 	// Is there a request to retry a failed drain activity. If yes reschedule drain
 	if failedDrain && HasDrainRetryAnnotation(n) {
-		h.drainScheduler.DeleteSchedule(n.GetName())
+		h.drainScheduler.DeleteSchedule(n)
 		h.scheduleDrain(n)
 		return
 	}

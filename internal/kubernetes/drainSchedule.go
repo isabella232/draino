@@ -3,6 +3,8 @@ package kubernetes
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,73 +23,110 @@ const (
 	SetConditionRetryPeriod = 50 * time.Millisecond
 
 	CustomDrainBufferAnnotation = "draino/drain-buffer"
+	DrainGroupAnnotation        = "draino/drain-group"
 )
 
 type DrainScheduler interface {
-	HasSchedule(name string) (has, failed bool)
+	HasSchedule(node *v1.Node) (has, failed bool)
 	Schedule(node *v1.Node) (time.Time, error)
-	DeleteSchedule(name string)
+	DeleteSchedule(node *v1.Node)
+	DeleteScheduleByName(nodeName string)
+}
+
+type SchedulesGroup struct {
+	schedules      map[string]*schedule
+	schedulesChain []string
+	period         time.Duration
 }
 
 type DrainSchedules struct {
 	sync.Mutex
-	schedules map[string]*schedule
-
-	lastDrainScheduledKey string
-	period                time.Duration
+	labelKeysForGroups []string
+	scheduleGroups     map[string]*SchedulesGroup
+	period             time.Duration
 
 	logger        *zap.Logger
 	drainer       Drainer
 	eventRecorder record.EventRecorder
 }
 
-func NewDrainSchedules(drainer Drainer, eventRecorder record.EventRecorder, period time.Duration, logger *zap.Logger) DrainScheduler {
+func NewDrainSchedules(drainer Drainer, eventRecorder record.EventRecorder, period time.Duration, labelKeysForGroups []string, logger *zap.Logger) DrainScheduler {
+	sort.Strings(labelKeysForGroups)
 	return &DrainSchedules{
-		schedules:     map[string]*schedule{},
-		period:        period,
-		logger:        logger,
-		drainer:       drainer,
-		eventRecorder: eventRecorder,
+		labelKeysForGroups: labelKeysForGroups,
+		scheduleGroups:     map[string]*SchedulesGroup{},
+		period:             period,
+		logger:             logger,
+		drainer:            drainer,
+		eventRecorder:      eventRecorder,
 	}
 }
 
-func (d *DrainSchedules) HasSchedule(name string) (has, failed bool) {
+func (d *DrainSchedules) getScheduleGroup(node *v1.Node) *SchedulesGroup {
+	values := []string{}
+	nodeLabels := node.Labels
+	if nodeLabels == nil {
+		nodeLabels = map[string]string{}
+	}
+	for _, key := range d.labelKeysForGroups {
+		values = append(values, nodeLabels[key])
+	}
+	if node.Annotations != nil {
+		values = append(values, node.Annotations[DrainGroupAnnotation])
+	}
+	groupKey := strings.Join(values, "#")
+
+	if group, ok := d.scheduleGroups[groupKey]; ok {
+		return group
+	}
+	newGroup := SchedulesGroup{
+		schedules: map[string]*schedule{},
+		period:    d.period,
+	}
+	d.scheduleGroups[groupKey] = &newGroup
+	return &newGroup
+}
+
+func (d *DrainSchedules) HasSchedule(node *v1.Node) (has, failed bool) {
 	d.Lock()
 	defer d.Unlock()
-	sched, ok := d.schedules[name]
+	grp := d.getScheduleGroup(node)
+	sched, ok := grp.schedules[node.GetName()]
 	if !ok {
 		return false, false
 	}
 	return true, sched.isFailed()
 }
 
-func (d *DrainSchedules) DeleteSchedule(name string) {
+func (d *DrainSchedules) DeleteSchedule(node *v1.Node) {
 	d.Lock()
 	defer d.Unlock()
-	if s, ok := d.schedules[name]; ok {
-		s.timer.Stop()
-	} else {
-		d.logger.Error("Failed schedule deletion", zap.String("key", name))
-	}
-	delete(d.schedules, name)
+	d.getScheduleGroup(node).removeSchedule(node.Name)
 }
 
-func (d *DrainSchedules) whenNextSchedule() time.Time {
+func (d *DrainSchedules) DeleteScheduleByName(name string) {
+	d.Lock()
+	defer d.Unlock()
+	for _, grp := range d.scheduleGroups {
+		grp.removeSchedule(name)
+	}
+}
+
+func (sg *SchedulesGroup) whenNextSchedule() time.Time {
 	// compute drain schedule time
 	sooner := time.Now().Add(SetConditionTimeout + time.Second)
-	period := d.period
+	period := sg.period
 	var when time.Time
-	fmt.Printf("previous key=%s\n", d.lastDrainScheduledKey)
-	fmt.Printf("map=%v\n", d.schedules)
-	if lastSchedule, ok := d.schedules[d.lastDrainScheduledKey]; ok {
-		fmt.Printf("found previous sched\n")
-		if lastSchedule.customDrainBuffer != nil {
-			fmt.Printf("found custom drain buffer\n")
-			period = *lastSchedule.customDrainBuffer
+	if len(sg.schedulesChain) > 0 {
+		lastScheduleName := sg.schedulesChain[len(sg.schedulesChain)-1]
+		if lastSchedule, ok := sg.schedules[lastScheduleName]; ok {
+			if lastSchedule.customDrainBuffer != nil {
+				fmt.Printf("found custom drain buffer\n")
+				period = *lastSchedule.customDrainBuffer
+			}
+			when = lastSchedule.when.Add(period)
 		}
-		when = lastSchedule.when.Add(period)
 	}
-
 	if when.Before(sooner) {
 		when = sooner
 	}
@@ -95,17 +134,38 @@ func (d *DrainSchedules) whenNextSchedule() time.Time {
 	return when
 }
 
+func (sg *SchedulesGroup) addSchedule(node *v1.Node, scheduleRunner func(node *v1.Node, when time.Time) *schedule) time.Time {
+	when := sg.whenNextSchedule()
+	sg.schedulesChain = append(sg.schedulesChain, node.GetName())
+	sg.schedules[node.GetName()] = scheduleRunner(node, when)
+	return when
+}
+
+func (sg *SchedulesGroup) removeSchedule(name string) {
+	if s, ok := sg.schedules[name]; ok {
+		s.timer.Stop()
+		delete(sg.schedules, name)
+	}
+	newScheduleChain := []string{}
+	for _, scheduleName := range sg.schedulesChain {
+		if scheduleName == name {
+			continue
+		}
+		newScheduleChain = append(newScheduleChain, scheduleName)
+	}
+	sg.schedulesChain = newScheduleChain
+}
+
 func (d *DrainSchedules) Schedule(node *v1.Node) (time.Time, error) {
 	d.Lock()
-	if sched, ok := d.schedules[node.GetName()]; ok {
+	scheduleGroup := d.getScheduleGroup(node)
+	if sched, ok := scheduleGroup.schedules[node.GetName()]; ok {
 		d.Unlock()
 		return sched.when, NewAlreadyScheduledError() // we already have a schedule planned
 	}
 
 	// compute drain schedule time
-	when := d.whenNextSchedule()
-	d.lastDrainScheduledKey = node.GetName()
-	d.schedules[d.lastDrainScheduledKey] = d.newSchedule(node, when)
+	when := scheduleGroup.addSchedule(node, d.newSchedule)
 	d.Unlock()
 
 	// Mark the node with the condition stating that drain is scheduled
@@ -117,7 +177,7 @@ func (d *DrainSchedules) Schedule(node *v1.Node) (time.Time, error) {
 		SetConditionTimeout,
 	); err != nil {
 		// if we cannot mark the node, let's remove the schedule
-		d.DeleteSchedule(node.GetName())
+		d.DeleteSchedule(node)
 		return time.Time{}, err
 	}
 	return when, nil
